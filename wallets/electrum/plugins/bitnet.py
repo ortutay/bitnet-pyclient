@@ -75,7 +75,8 @@ class Plugin(BasePlugin):
         #     "datetime >": ,
         #     }
         # TODO(ortutay): datetime comparison on the backend
-        self.client.Listen(self.handle_new_message)
+        self.client.Listen(self.handle_new_message,
+                           {"to-pubkey": self.client.PubKeyStr()})
 
         return w
 
@@ -107,3 +108,4 @@ class Plugin(BasePlugin):
         except:
             sender = "unknown-sender"
         self.dialog.appendPlainText("Got from %s: %s" % (sender, to_show))
+        self.dialog.repaint(self.dialog.rect())
