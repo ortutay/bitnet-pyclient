@@ -20,8 +20,8 @@ from Crypto.Cipher import PKCS1_OAEP
 from Crypto.PublicKey import RSA
 
 _JSON_RPC_HEADERS = {"Content-Type": "application/json"}
-# _DEFAULT_ADDR = "54.187.157.104:8555"
-_DEFAULT_ADDR = "localhost:8555"
+_DEFAULT_ADDR = "54.187.157.104:8555"
+# _DEFAULT_ADDR = "localhost:8555"
 
 logging.basicConfig(format='%(levelname)s %(name)s %(asctime)-15s %(filename)s:%(lineno)d %(message)s')
 _logger = logging.getLogger("bitnet")
