@@ -20,14 +20,16 @@ from Crypto.Cipher import PKCS1_OAEP
 from Crypto.PublicKey import RSA
 
 _JSON_RPC_HEADERS = {"Content-Type": "application/json"}
-_DEFAULT_ADDR = "54.187.157.104:8555"
-# _DEFAULT_ADDR = "localhost:8555"
+# _DEFAULT_ADDR = "54.187.157.104:8555"
+_DEFAULT_ADDR = "localhost:8555"
 
 logging.basicConfig(format='%(levelname)s %(name)s %(asctime)-15s %(filename)s:%(lineno)d %(message)s')
 _logger = logging.getLogger("bitnet")
 # TODO(ortutay): set lower logger level for prod
 _logger.setLevel(logging.INFO)
 
+def SetLogLevel(level):
+    _logger.setLevel(level)
 
 # Stub Plugin, for when we are loading from Electrum wallet. No-op otherwise.
 try:
@@ -40,7 +42,10 @@ try:
 except:
     pass
 
-class BitnetRPCException(Exception):
+class BitnetException(Exception):
+    pass
+
+class BitnetRPCException(BitnetException):
     pass
 
 class BitnetClient:
@@ -56,7 +61,7 @@ class BitnetClient:
 
         id_key_path =  "%s/id.pem" % data_path
         msg_key_path =  "%s/msg.pem" % data_path
-        client_key_path =  "%s/client_data.json" % data_path
+        self._client_data_path =  "%s/client_data.json" % data_path
 
         # ID key
         try:
@@ -75,7 +80,8 @@ class BitnetClient:
             msg_key_data = open(msg_key_path, "r").read()
             self.msg_key = RSA.importKey(msg_key_data)
         except IOError:
-            self.msg_key = RSA.generate(1024, Random.new().read)
+            # TODO(ortutay): use 4096 bits instead?
+            self.msg_key = RSA.generate(2048, Random.new().read)
             msg_enc = self.msg_key.exportKey('PEM')
             open(msg_key_path, "w").write(msg_enc)
 
@@ -84,7 +90,7 @@ class BitnetClient:
         self._next_listener_id = 1
         self._seen_messages = set([])
         try:
-            self._data = json.loads(open(client_data_path, "r").read())
+            self._data = json.loads(open(self._client_data_path, "r").read())
         except:
             self._data = {}
         self.url = "http://%s/bitnetRPC" % addr
@@ -103,6 +109,9 @@ class BitnetClient:
                 "type": "bitnet.RSAPubKey",
                 "body": self.MsgPubKeyStr(),
             })
+
+    def _StoreData(self):
+        open(self._client_data_path, "w").write(json.dumps(self._data))
 
     def PubKeyStr(self):
         compressed = True
@@ -130,14 +139,17 @@ class BitnetClient:
         # TODO(ortutay): implement
         pass
 
-    def _GetAesPriv(self, to_pub_key):
-        if "aes_priv_keys" not in self._data:
-            self._data["aes_priv_keys"] = {}
+    def _GetAesPrivForSend(self, to_pub_key):
+        if "pub_to_aes_priv" not in self._data:
+            self._data["pub_to_aes_priv"] = {}
         if "rsa_pub_keys" not in self._data:
             self._data["rsa_pub_keys"] = {}
-            
-        if to_pub_key in self._data["aes_priv_keys"]:
-            return self._data["aes_priv_keys"][to_pub_key]
+
+        print "DATA:", self._data
+
+        # TODO(ortutay): Use one-off keys for each message.
+        if to_pub_key in self._data["pub_to_aes_priv"]:
+            return self._data["pub_to_aes_priv"][to_pub_key]
         
         if to_pub_key not in self._data["rsa_pub_keys"]:
             msgs = self.Get({
@@ -157,28 +169,37 @@ class BitnetClient:
         # TODO(ortutay): Review this key generation code.
         # TODO(ortutay): Look at and choose appropriate options.
         bits = cryptorandom.getrandbits(256)
-        aes_priv = (hex(bits)[2:].rstrip("L")).rjust(32, "0")
-        print "aes_priv", aes_priv
-        k = binascii.unhexlify(aes_priv)
+        aes_priv_hex = (hex(bits)[2:].rstrip("L")).rjust(32, "0")
+        print "aes_priv_hex", aes_priv_hex
+        k = binascii.unhexlify(aes_priv_hex)
         aes_key = AES.new(k)
 
         rsa_pub_key = RSA.importKey(binascii.unhexlify(rsa_pub_key))
         rsa_pub = PKCS1_OAEP.new(rsa_pub_key)
 
-        ciphertext = rsa_pub.encrypt(aes_priv)
+        ciphertext = rsa_pub.encrypt(aes_priv_hex)
         body = base64.b64encode(ciphertext)
-        self.Send(None, {
+        msg = {
             "to-pubkey": to_pub_key,
+            "datetime": _Datetime(),
             "type": "bitnet.AESPrivKey",
             "encrypted-body": body,
-        })
-        return aes_priv
+        }
+        print "send msg:", msg
+        self.Send(None, msg)
+        self._data["pub_to_aes_priv"][to_pub_key] = aes_priv_hex
+        self._StoreData()
+        return aes_priv_hex
 
     def SendEncrypted(self, to_pub_key, message):
-        aes_priv = self._GetAesPriv(to_pub_key)
-        to_priv_key_hash = hashlib.sha256(aes_priv).hexdigest()
+        aes_priv_hex = self._GetAesPrivForSend(to_pub_key)
+        to_priv_key_hash = _AESPrivKeyHash(aes_priv_hex)
+        aes_priv = binascii.unhexlify(aes_priv_hex)
         aes_cipher = AESCipher(aes_priv)
         encrypted = base64.b64encode(aes_cipher.encrypt(message))
+        print "aes priv hex:", aes_priv_hex
+        re_plaintext = aes_cipher.decrypt(base64.b64decode(encrypted))
+        print "re plaintxt:", re_plaintext
         # TODO(ortutay): handle message headers
         self.Send(None, {
             "type": "bitnet.AESEncrypted",
@@ -233,36 +254,152 @@ class BitnetClient:
         return StoreMessage(self.url, tokens, message)
 
     def Get(self, query=None):
+        # Do not mutate passed query
+        if query:
+            query = dict(query)
+
         if not query:
             query = {"to-pubkey": self.PubKeyStr()}
+
+        # Get plaintext
         tokens = self.Tokens(-1)
         resp = GetMessages(self.url, tokens, {"Headers": query})
+        print "get plaintext got", resp
+        plaintext_msgs = []
         try:
-            return resp["result"]["Messages"]
+            plaintext_msgs = resp["result"]["Messages"]
         except:
+            pass
+
+        # Get encrypted
+        encrypted_msgs = self._GetEncrypted(query)
+        print "get encrypted got", encrypted_msgs
+
+        return plaintext_msgs + encrypted_msgs
+
+    def _GetEncrypted(self, query=None):
+        # Do not mutate passed query
+        if query:
+            query = dict(query)
+
+        if not query:
+            query = {}
+
+        # TODO(ortutay): Think of better approach here
+        if "to-pubkey" in query:
+            del query["to-pubkey"]
+
+        print "get encrypted", query
+
+        base_query = dict(query)
+
+        tokens = self.Tokens(-1)
+
+        # TODO(ortutay): This code is very inefficient, especially as we rack
+        # up a large number of AES private keys. We should add the ability to
+        # "or" together queries, and also to use a bloom filter to in queries.
+        aes_privs_query = dict(base_query)
+        aes_privs_query["to-pubkey"] = self.PubKeyStr()
+        aes_privs_query["type"] = "bitnet.AESPrivKey"
+        print "aes privs query", aes_privs_query
+        resp = GetMessages(self.url, tokens, {"Headers": aes_privs_query})
+        try:
+            aes_privs_msgs = resp["result"]["Messages"]
+        except:
+            aes_privs_msgs = []
+
+        print "enc resp", resp
+        print "aes privs msgs", aes_privs_msgs
+
+        rsa_cipher = PKCS1_OAEP.new(self.msg_key)
+        if aes_privs_msgs:
+            for msg in aes_privs_msgs:
+                try:
+                    aes_priv_encrypted = msg["Encrypted"]
+                except KeyError:
+                    continue
+                try:
+                    aes_priv_hex = rsa_cipher.decrypt(
+                        base64.b64decode(aes_priv_encrypted))
+                except Exception as e:
+                    _logger.error("Couldn't decrypt AES private key %s: %s" %
+                                  (aes_priv_encrypted, str(e)))
+
+                if "aes_privs" not in self._data:
+                    self._data["aes_privs"] = []
+                if aes_priv_hex not in self._data["aes_privs"]:
+                    self._data["aes_privs"].append(aes_priv_hex)
+            self._StoreData()
+
+        if "aes_privs" not in self._data:
             return []
+
+        ret_msgs = []
+        for aes_priv_hex in self._data["aes_privs"]:
+            aes_priv = binascii.unhexlify(aes_priv_hex)
+            aes_cipher = AESCipher(aes_priv)
+            print "aes_priv_hex:", aes_priv_hex
+            query = dict(base_query)
+            query["type"] = "bitnet.AESEncrypted"
+            query["to"] = _AESPrivKeyHash(aes_priv_hex)
+            print "aes encrypted query", query
+            resp = GetMessages(self.url, tokens, {"Headers": query})
+            msgs = resp["result"]["Messages"]
+            for msg in msgs:
+                ciphertext = msg["Encrypted"]
+                plaintext = aes_cipher.decrypt(base64.b64decode(ciphertext))
+                print "got plaintext:", plaintext, " from ", ciphertext, "using", aes_priv_hex
+                msg["Encrypted"] = {"Body": plaintext}
+                ret_msgs.append(msg)
+            # print resp
+
+        print "returning", ret_msgs
+        return ret_msgs
 
     # Receive new messages.
     # Overrides "datetime >" field in query.
     def Listen(self, handler, query=None):
+        # Do not mutate passed query
+        if query:
+            query = dict(query)
+
+        print "Listen query:", query
         if not query:
             query = {"to-pubkey": self.PubKeyStr()}
+        print "Listen query2:", query
         # Server currently does not charge for "GetMessages" RPC
         tokens = self.Tokens(-1)
-        def periodic_poll(client, url, handler, tokens, query):
-            datetime_gt = datetime.datetime.utcnow()
+
+        # TODO(ortutay): Once we are using Web sockets instead of polling, this
+        # part shouldn't be necessary.
+        print "3 query", query
+        current_msgs = self.Get(query)
+        print "4 query", query
+        datetime_gt = None
+        if current_msgs:
+            datetime_gt = _MostRecentDatetime(current_msgs)
+
+        def periodic_poll(client, url, handler, tokens, query, datetime_gt):
+            print "peridoc_poll query", query
             while True:
                 try:
-                    query["datetime >"] = datetime_gt.isoformat("T") + "Z"
+                    if datetime_gt:
+                        query["datetime >"] = datetime_gt.isoformat("T") + "Z"
+                    print "calling GetMessages", query
                     resp = GetMessages(url, tokens, {"Headers": query})
+                    print "GetMessages resp", resp
+                    encrypted_msgs = self._GetEncrypted(query)
 
-                    # Following line is skipped if GetMessages raises exception.
-                    datetime_gt = datetime.datetime.utcnow()
+                    # Following is skipped if GetMessages or _GetEncrypted
+                    # raises exception
+                    msgs = resp["result"]["Messages"] + encrypted_msgs
+                    if msgs:
+                        datetime_gt = _MostRecentDatetime(msgs)
                 except BitnetRPCException as e:
                     _logger.error("Error on GetMessages(%s, %s): %s" % (
                         tokens, query, str(e)))
                     continue
-                for msg in resp["result"]["Messages"]:
+                for msg in msgs:
                     try: 
                         h = msg["Plaintext"]["Headers"]["message-hash"][0]
                         if h in client._seen_messages:
@@ -274,9 +411,10 @@ class BitnetClient:
                 time.sleep(5)
         id = "get-messages-poll-%d" % self._next_listener_id
         self._next_listener_id += 1
+        print "passing query", query
         thr = threading.Thread(
             group=None, target=periodic_poll, name=id,
-            args=(self, self.url, handler, tokens, query))
+            args=(self, self.url, handler, tokens, query, datetime_gt))
         thr.daemon = True
         thr.start()
         return id
@@ -284,6 +422,30 @@ class BitnetClient:
     def StopListening(self, id):
         # TODO(ortutay): implement
         pass
+
+# Mutates the list
+def _MostRecentDatetime(msgs):
+    if not msgs:
+        return None
+    msgs.sort(key=_MessageDatetimeKey, reverse=True)
+    try:
+        dt_str = msgs[0]["Plaintext"]["Headers"]["datetime"][0]
+        return _ParseRFC3339(dt_str)
+    except Exception:
+        return None
+
+def _MessageDatetimeKey(msg):
+    try:
+        dt_str = msg["Plaintext"]["Headers"]["datetime"][0]
+    except Exception:
+        return 0
+    dt = _ParseRFC3339(dt_str)
+    return int(dt.strftime("%s"))
+
+def _ParseRFC3339(dt_str):
+    dt_str = dt_str.rstrip("Z")
+    dt = datetime.datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S.%f")
+    return dt
 
 def Challenge(url):
     req = {
@@ -372,14 +534,16 @@ def sha256(x):
 def _Datetime():
     return datetime.datetime.utcnow().isoformat("T") + "Z"
 
+def _AESPrivKeyHash(aes_priv):
+    return hashlib.sha256(aes_priv).hexdigest()
+
 # TODO(ortutay): Review the code below.
 class AESCipher:
     def __init__(self, key):
         self.bs = 32
-        if len(key) >= 32:
-            self.key = key[:32]
-        else:
-            self.key = self._pad(key)
+        if len(key) != 32:
+            raise Exception("Unexpected key length %d bytes" % len(key))
+        self.key = key
 
     def encrypt(self, raw):
         raw = self._pad(raw)
@@ -397,6 +561,3 @@ class AESCipher:
 
     def _unpad(self, s):
         return s[:-ord(s[len(s)-1:])]
-
-if __name__ == "__main__":
-    client = BitnetClient2()
