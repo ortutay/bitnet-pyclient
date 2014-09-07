@@ -1,5 +1,7 @@
+#!/usr/bin/python
 import bitnet_client
 import logging
+
 from bitnet_client import BitnetClient
 
 bitnet_client.SetLogLevel(logging.WARNING)
